@@ -1,17 +1,23 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
+	"encoding/json"
+	"fmt"
+	"io"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"time"
 
-	"github.com/gin-gonic/gin"
-	"go.uber.org/zap"
 	"uveitis/backend/pkg/config"
 	"uveitis/backend/pkg/storage"
+
+	"github.com/gin-gonic/gin"
+	"go.uber.org/zap"
 )
 
 type Server struct {
@@ -43,12 +49,18 @@ func (s *Server) Router() *gin.Engine {
 		auth.GET("/profile", s.profile)
 		auth.GET("/tables", s.listTables)
 		auth.POST("/tables", s.createTable)
+		auth.PUT("/tables/:table", s.updateTable)
+		auth.DELETE("/tables/:table", s.dropTable)
+		auth.POST("/tables/:table/clear", s.clearTable)
+		auth.POST("/tables/:table/export", s.exportTable)
 		auth.POST("/tables/:table/columns", s.addColumns)
+		auth.PUT("/tables/:table/columns", s.updateColumns)
 		auth.DELETE("/tables/:table/columns", s.dropColumns)
 		auth.GET("/tables/:table/data", s.queryData)
 		auth.POST("/tables/:table/data", s.insertRow)
 		auth.PUT("/tables/:table/data/:id", s.updateRow)
 		auth.DELETE("/tables/:table/data/:id", s.deleteRow)
+		auth.POST("/tables/:table/data/batch-delete", s.batchDeleteRows)
 		auth.POST("/tables/:table/import", s.importCSV)
 		auth.GET("/tables/:table/summary", s.summary)
 	}
@@ -101,6 +113,28 @@ func (s *Server) createTable(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"message": "创建成功"})
 }
 
+func (s *Server) updateTable(c *gin.Context) {
+	ctx := c.Request.Context()
+	table := c.Param("table")
+	var schema storage.TableSchema
+	if err := c.ShouldBindJSON(&schema); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "请求格式错误"})
+		return
+	}
+	if schema.Name == "" {
+		schema.Name = table
+	}
+	if err := s.store.UpdateTable(ctx, table, schema); err != nil {
+		if strings.Contains(err.Error(), "不支持修改类型") {
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			return
+		}
+		s.fail(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"message": "表结构已更新"})
+}
+
 func (s *Server) addColumns(c *gin.Context) {
 	ctx := c.Request.Context()
 	table := c.Param("table")
@@ -116,6 +150,23 @@ func (s *Server) addColumns(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"message": "已添加字段"})
+}
+
+func (s *Server) updateColumns(c *gin.Context) {
+	ctx := c.Request.Context()
+	table := c.Param("table")
+	var payload struct {
+		Fields []storage.FieldDefinition `json:"fields"`
+	}
+	if err := c.ShouldBindJSON(&payload); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "请求格式错误"})
+		return
+	}
+	if err := s.store.UpdateColumns(ctx, table, payload.Fields); err != nil {
+		s.fail(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"message": "字段已更新"})
 }
 
 func (s *Server) dropColumns(c *gin.Context) {
@@ -203,6 +254,31 @@ func (s *Server) deleteRow(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"message": "已删除"})
 }
 
+func (s *Server) batchDeleteRows(c *gin.Context) {
+	ctx := c.Request.Context()
+	table := c.Param("table")
+
+	var body struct {
+		Ids []int64 `json:"ids"`
+	}
+	if err := c.ShouldBindJSON(&body); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "参数错误，需要 id 列表"})
+		return
+	}
+
+	if len(body.Ids) == 0 {
+		c.JSON(http.StatusOK, gin.H{"message": "无数据需要删除"})
+		return
+	}
+
+	if err := s.store.DeleteRows(ctx, table, body.Ids); err != nil {
+		s.fail(c, err)
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"message": fmt.Sprintf("已删除 %d 条记录", len(body.Ids))})
+}
+
 func (s *Server) importCSV(c *gin.Context) {
 	ctx := c.Request.Context()
 	table := c.Param("table")
@@ -217,12 +293,99 @@ func (s *Server) importCSV(c *gin.Context) {
 		return
 	}
 	defer f.Close()
-	count, err := s.store.ImportCSV(ctx, table, f)
+
+	head := make([]byte, 512)
+	n, _ := f.Read(head)
+	head = head[:n]
+	reader := io.MultiReader(bytes.NewReader(head), f)
+
+	filename := strings.ToLower(file.Filename)
+	isExcel := strings.HasSuffix(filename, ".xlsx")
+	isXLS := strings.HasSuffix(filename, ".xls")
+	if bytes.HasPrefix(head, []byte{0x50, 0x4b, 0x03, 0x04}) { // ZIP magic header for .xlsx
+		isExcel = true
+	}
+	if isXLS && !isExcel {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "暂不支持 .xls，请另存为 .xlsx 或 CSV"})
+		return
+	}
+
+	if isExcel {
+		data, err := io.ReadAll(reader)
+		if err != nil {
+			s.fail(c, err)
+			return
+		}
+		count, err := s.store.ImportExcel(ctx, table, data, allowUnknown(c), parseAliases(c))
+		if uerr, ok := err.(*storage.UnknownColumnsError); ok {
+			c.JSON(http.StatusBadRequest, gin.H{
+				"error":           "存在未识别列",
+				"unknown_columns": uerr.Columns,
+			})
+			return
+		}
+		if err != nil {
+			s.fail(c, err)
+			return
+		}
+		c.JSON(http.StatusOK, gin.H{"imported": count})
+		return
+	}
+
+	count, err := s.store.ImportCSV(ctx, table, reader, allowUnknown(c), parseAliases(c))
+	if uerr, ok := err.(*storage.UnknownColumnsError); ok {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error":           "存在未识别列",
+			"unknown_columns": uerr.Columns,
+		})
+		return
+	}
 	if err != nil {
 		s.fail(c, err)
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"imported": count})
+}
+
+func (s *Server) exportTable(c *gin.Context) {
+	ctx := c.Request.Context()
+	table := c.Param("table")
+	var body struct {
+		Ids     []int64           `json:"ids"`
+		Search  string            `json:"search"`
+		SortBy  string            `json:"sort_by"`
+		Desc    bool              `json:"desc"`
+		Page    int               `json:"page"`
+		Size    int               `json:"size"`
+		Filters map[string]string `json:"filters"`
+		All     bool              `json:"all"`
+	}
+	if err := c.ShouldBindJSON(&body); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "请求格式错误"})
+		return
+	}
+	opts := storage.QueryOptions{
+		Search:   body.Search,
+		Filters:  body.Filters,
+		Page:     body.Page,
+		PageSize: body.Size,
+		SortBy:   body.SortBy,
+		Desc:     body.Desc,
+	}
+	data, displayName, err := s.store.ExportExcel(ctx, table, opts, body.Ids, body.All)
+	if err != nil {
+		s.fail(c, err)
+		return
+	}
+	base := displayName
+	if base == "" {
+		base = table
+	}
+	filename := fmt.Sprintf("%s_%s.xlsx", base, time.Now().Format("20060102150405"))
+	encoded := url.QueryEscape(filename)
+	c.Header("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+	c.Header("Content-Disposition", fmt.Sprintf("attachment; filename=\"%s\"; filename*=UTF-8''%s", encoded, encoded))
+	c.Data(http.StatusOK, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", data)
 }
 
 func (s *Server) summary(c *gin.Context) {
@@ -239,6 +402,26 @@ func (s *Server) summary(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"summary": res})
+}
+
+func (s *Server) clearTable(c *gin.Context) {
+	ctx := c.Request.Context()
+	table := c.Param("table")
+	if err := s.store.ClearTable(ctx, table); err != nil {
+		s.fail(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"message": "数据已清空"})
+}
+
+func (s *Server) dropTable(c *gin.Context) {
+	ctx := c.Request.Context()
+	table := c.Param("table")
+	if err := s.store.DropTable(ctx, table); err != nil {
+		s.fail(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"message": "表已删除"})
 }
 
 func (s *Server) fail(c *gin.Context, err error) {
@@ -270,6 +453,23 @@ func mapFromQuery(c *gin.Context, prefix string) map[string]string {
 		}
 	}
 	return result
+}
+
+func allowUnknown(c *gin.Context) bool {
+	val := c.DefaultPostForm("allow_unknown", c.Query("allow_unknown"))
+	return val == "1" || strings.ToLower(val) == "true"
+}
+
+func parseAliases(c *gin.Context) map[string]string {
+	raw := c.DefaultPostForm("column_aliases", c.Query("column_aliases"))
+	if raw == "" {
+		return nil
+	}
+	var m map[string]string
+	if err := json.Unmarshal([]byte(raw), &m); err != nil {
+		return nil
+	}
+	return m
 }
 
 func requestLogger(log *zap.Logger) gin.HandlerFunc {
